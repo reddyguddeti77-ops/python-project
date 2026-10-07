@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>UPI Reconciliation</title>
+<style>
+  :root {
+    --navy: #1f3864;
+    --accent: #2e74b5;
+    --bg: #f4f7fb;
+    --card-bg: #ffffff;
+    --border: #dbe4ee;
+    --matched: #2e8b57;
+    --unsettled: #c0392b;
+    --double: #d68910;
+    --reversed: #8e44ad;
+    --mismatch: #b7791f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: #222;
+  }
+  header { background: var(--navy); color: white; padding: 20px 30px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 6px 0 0; font-size: 13px; color: #cfe0f5; }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px 16px 60px; }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px 24px; margin-bottom: 24px;
+  }
+  .card h2 { margin-top: 0; color: var(--navy); font-size: 18px; }
+  #upload-form { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+  #upload-form label {
+    display: flex; flex-direction: column; font-size: 13px; color: #555; gap: 4px;
+  }
+  button {
+    background: var(--accent); color: white; border: none; padding: 10px 18px;
+    border-radius: 6px; cursor: pointer; font-size: 14px;
+  }
+  button:hover { background: var(--navy); }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  #upload-status { margin-top: 10px; font-size: 14px; color: var(--accent); }
+  #upload-status.error { color: var(--unsettled); }
+  .summary-grid { display: flex; flex-wrap: wrap; gap: 14px; }
+  .summary-box {
+    flex: 1; min-width: 130px; border-radius: 8px; padding: 14px;
+    color: white; text-align: center;
+  }
+  .summary-box .count { font-size: 26px; font-weight: bold; display: block; }
+  .summary-box .label { font-size: 12px; opacity: 0.9; }
+  .status-MATCHED { background: var(--matched); }
+  .status-UNSETTLED { background: var(--unsettled); }
+  .status-DOUBLE_SETTLED { background: var(--double); }
+  .status-REVERSED { background: var(--reversed); }
+  .status-AMOUNT_MISMATCH { background: var(--mismatch); }
+  .table-controls {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; flex-wrap: wrap; gap: 10px;
+  }
+  .table-wrapper { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { background: #eef3fa; color: var(--navy); }
+  td.status-cell span { padding: 3px 8px; border-radius: 12px; color: white; font-size: 12px; }
+  .empty-msg { color: #777; font-size: 14px; padding: 10px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>UPI Transaction Reconciliation</h1>
+  <p>Runs entirely in your browser — no server, no install, just this file.</p>
+</header>
+
+<main>
+
+  <section class="card">
+    <h2>1. Upload your two files</h2>
+    <form id="upload-form">
+      <label>
+        Merchant transactions CSV
+        <input type="file" id="merchant-file" accept=".csv" required />
+      </label>
+      <label>
+        NPCI settlement CSV
+        <input type="file" id="settlement-file" accept=".csv" required />
+      </label>
+      <button type="submit">Run reconciliation</button>
+    </form>
+    <p id="upload-status"></p>
+  </section>
+
+  <section class="card">
+    <h2>2. Summary</h2>
+    <div id="summary-cards" class="summary-grid">
+      <p class="empty-msg">Upload files above to see results.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3. All transactions</h2>
+    <div class="table-controls">
+      <label>
+        Filter by status:
+        <select id="status-filter">
+          <option value="ALL">All</option>
+        </select>
+      </label>
+      <button id="download-btn" disabled>Download CSV</button>
+    </div>
+    <div class="table-wrapper">
+      <table id="results-table">
+        <thead>
+          <tr>
+            <th>Transaction ID</th>
+            <th>Matched RRN</th>
+            <th>Merchant Amount</th>
+            <th>Settled Amount</th>
+            <th>Status</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<script>
+/* ============================================================
+   PART A: A very small CSV parser (no external libraries).
+   Good enough for simple CSVs with no commas inside fields,
+   which is exactly what our merchant/settlement files look like.
+   ============================================================ */
+function parseCSV(text) {
+  const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim().length > 0);
+  const headers = lines[0].split(",").map(h => h.trim());
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(",");
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = (values[idx] ?? "").trim(); });
+    rows.push(row);
+  }
+  return rows;
+}
+
+/* ============================================================
+   PART B: Normalising reference numbers.
+   Mirrors the Python normalise_ref() function from db/load_data.py
+   so the logic matches the rest of the project.
+   ============================================================ */
+function normaliseRef(value) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim().toUpperCase().replace("RRN", "").replace(/\s/g, "");
+}
+
+const AMOUNT_TOLERANCE = 0.01;
+
+/* ============================================================
+   PART C: The reconciliation engine itself.
+   Mirrors engine/reconcile.py:
+     - split settlement rows into PAY vs REFUND
+     - match merchant txns to PAY rows by reference number
+     - link REFUND rows back via original_rrn
+     - classify each merchant transaction
+   ============================================================ */
+function reconcile(merchantRows, settlementRows) {
+  const payByRrn = {};
+  const refundByOriginalRrn = {};
+
+  settlementRows.forEach(s => {
+    const type = (s.txn_type || "").trim().toUpperCase();
+    const rrn = normaliseRef(s.rrn);
+    const amount = parseFloat(s.settlement_amount);
+
+    if (type === "PAY") {
+      if (!payByRrn[rrn]) payByRrn[rrn] = [];
+      payByRrn[rrn].push({ rrn, amount });
+    } else if (type === "REFUND" || type === "REVERSAL") {
+      const originalRrn = normaliseRef(s.original_rrn);
+      if (!originalRrn) return;
+      if (!refundByOriginalRrn[originalRrn]) refundByOriginalRrn[originalRrn] = [];
+      refundByOriginalRrn[originalRrn].push({ rrn, amount });
+    }
+  });
+
+  return merchantRows.map(txn => {
+    const refId = normaliseRef(txn.upi_ref_id);
+    const merchantAmount = parseFloat(txn.amount);
+    const matches = payByRrn[refId] || [];
+    const refunds = refundByOriginalRrn[refId] || [];
+
+    let status, notes, matchedRrn, settledAmount;
+
+    if (refunds.length > 0) {
+      status = "REVERSED";
+      matchedRrn = refunds.map(r => r.rrn).join(", ");
+      settledAmount = refunds.reduce((sum, r) => sum + r.amount, 0);
+      notes = `Refunded via RRN(s): ${matchedRrn}`;
+    } else if (matches.length === 0) {
+      status = "UNSETTLED";
+      matchedRrn = "";
+      settledAmount = null;
+      notes = "No matching settlement row found in NPCI file.";
+    } else if (matches.length === 1) {
+      matchedRrn = matches[0].rrn;
+      settledAmount = matches[0].amount;
+      if (Math.abs(settledAmount - merchantAmount) <= AMOUNT_TOLERANCE) {
+        status = "MATCHED";
+        notes = "Amount matches settlement exactly.";
+      } else {
+        status = "AMOUNT_MISMATCH";
+        notes = `Merchant amount ${merchantAmount} vs settled ${settledAmount}.`;
+      }
+    } else {
+      status = "DOUBLE_SETTLED";
+      matchedRrn = matches[0].rrn;
+      settledAmount = matches.reduce((sum, m) => sum + m.amount, 0);
+      notes = `Settled ${matches.length} times for the same transaction.`;
+    }
+
+    return {
+      txn_id: txn.txn_id,
+      matched_rrn: matchedRrn,
+      merchant_amount: merchantAmount,
+      settled_amount: settledAmount,
+      status,
+      notes,
+    };
+  });
+}
+
+/* ============================================================
+   PART D: Wiring it up to the page (reading files, rendering)
+   ============================================================ */
+let currentResults = [];
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
+
+document.getElementById("upload-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const statusEl = document.getElementById("upload-status");
+  statusEl.classList.remove("error");
+  statusEl.textContent = "Reading files...";
+
+  try {
+    const merchantFile = document.getElementById("merchant-file").files[0];
+    const settlementFile = document.getElementById("settlement-file").files[0];
+    if (!merchantFile || !settlementFile) {
+      throw new Error("Please choose both files.");
+    }
+
+    const [merchantText, settlementText] = await Promise.all([
+      readFileAsText(merchantFile),
+      readFileAsText(settlementFile),
+    ]);
+
+    const merchantRows = parseCSV(merchantText);
+    const settlementRows = parseCSV(settlementText);
+
+    currentResults = reconcile(merchantRows, settlementRows);
+    renderSummary(currentResults);
+    renderTable(currentResults);
+    document.getElementById("download-btn").disabled = false;
+
+    statusEl.textContent = `Done. Reconciled ${currentResults.length} transactions.`;
+  } catch (err) {
+    statusEl.classList.add("error");
+    statusEl.textContent = "Error: " + err.message;
+    console.error(err);
+  }
+});
+
+function renderSummary(results) {
+  const counts = {};
+  results.forEach(r => { counts[r.status] = (counts[r.status] || 0) + 1; });
+
+  const container = document.getElementById("summary-cards");
+  container.innerHTML = "";
+  Object.entries(counts).forEach(([status, count]) => {
+    const box = document.createElement("div");
+    box.className = `summary-box status-${status}`;
+    box.innerHTML = `<span class="count">${count}</span><span class="label">${status}</span>`;
+    container.appendChild(box);
+  });
+
+  // also refresh the filter dropdown options
+  const filter = document.getElementById("status-filter");
+  const current = filter.value;
+  filter.innerHTML = '<option value="ALL">All</option>';
+  Object.keys(counts).forEach(status => {
+    const opt = document.createElement("option");
+    opt.value = status;
+    opt.textContent = status;
+    filter.appendChild(opt);
+  });
+  filter.value = Object.keys(counts).includes(current) ? current : "ALL";
+}
+
+function renderTable(results) {
+  const filterValue = document.getElementById("status-filter").value;
+  const rows = filterValue === "ALL" ? results : results.filter(r => r.status === filterValue);
+
+  const body = document.getElementById("results-body");
+  body.innerHTML = "";
+
+  if (rows.length === 0) {
+    body.innerHTML = '<tr><td colspan="6" class="empty-msg">No transactions to show.</td></tr>';
+    return;
+  }
+
+  rows.forEach(r => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.txn_id}</td>
+      <td>${r.matched_rrn || "-"}</td>
+      <td>${r.merchant_amount.toFixed(2)}</td>
+      <td>${r.settled_amount !== null ? r.settled_amount.toFixed(2) : "-"}</td>
+      <td class="status-cell"><span class="status-${r.status}">${r.status}</span></td>
+      <td>${r.notes}</td>
+    `;
+    body.appendChild(tr);
+  });
+}
+
+document.getElementById("status-filter").addEventListener("change", () => renderTable(currentResults));
+
+document.getElementById("download-btn").addEventListener("click", () => {
+  if (currentResults.length === 0) return;
+  const headers = ["txn_id", "matched_rrn", "merchant_amount", "settled_amount", "status", "notes"];
+  const csvLines = [headers.join(",")];
+  currentResults.forEach(r => {
+    csvLines.push(headers.map(h => `"${r[h] ?? ""}"`).join(","));
+  });
+  const blob = new Blob([csvLines.join("\n")], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "reconciliation_report.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+
+</body>
+</html>
